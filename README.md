@@ -14,7 +14,7 @@ The project uses classical image-processing techniques to improve contrast, enha
 
 ## 🚀 Live Demo
 <p align="center">
-  <a href="[YOUR_LIVE_DEMO_URL](https://fogcleaner.netlify.app/)"> Live Demo</a>
+  <a href="[https://fogcleaner.netlify.app/]"> Live Demo</a>
 </p>
 
 ---
