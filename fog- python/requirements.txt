@@ -1,0 +1,5 @@
+streamlit>=1.62
+numpy
+opencv-python-headless
+scipy
+pillow
