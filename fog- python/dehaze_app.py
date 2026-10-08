@@ -317,13 +317,6 @@ def render_header():
     html = f"""
     <div class="ufc-header">
       <div class="ufc-topbar">Urban Fog Cleaner</div>
-      <div class="ufc-hero">
-        <h1>Load a Frame</h1>
-        <p>Drop in a hazy photo or pull a frame from a camera export. Everything runs
-        on this machine through the real dark-channel-prior dehazing pipeline &mdash;
-        histogram stretching, frequency-domain detail boost, and adaptive
-        smoothing/sharpening, all tunable live.</p>
-      </div>
       <div class="ufc-strip">
         {cloud_layers_html}
         {car_layers_html}
@@ -346,17 +339,8 @@ def render_header():
       .ufc-topbar {{
         font-family:'Big Shoulders Display',sans-serif; font-weight:800; font-size:19px;
         text-transform:uppercase; letter-spacing:.03em; color:#111;
-        padding:20px calc(100vw/9 + 84px) 0 calc(100vw/9 + 84px);
+        padding:16px calc(100vw/9 + 84px) 14px calc(100vw/9 + 84px);
       }}
-      .ufc-hero {{
-        padding:4px calc(100vw/9 + 84px) 18px calc(100vw/9 + 84px);
-        max-width:calc(856px + 100vw/9);
-      }}
-      .ufc-hero h1 {{
-        font-family:'Big Shoulders Display',sans-serif; font-weight:800; font-size:56px;
-        text-transform:uppercase; margin:2px 0 8px 0; line-height:0.95; color:#111;
-      }}
-      .ufc-hero p {{ font-size:14.5px; color:#4a4a4a; line-height:1.55; margin:0; }}
       .ufc-strip {{
         position:relative; height:170px; overflow:hidden;
         border-top:1px solid rgba(0,0,0,.07);
@@ -379,7 +363,7 @@ def render_header():
       }}
     </style>
     """
-    _embed_html(html, height=440)
+    _embed_html(html, height=226)
 
 
 # ============================================================
@@ -394,6 +378,19 @@ def inject_css():
 
         [data-testid="stAppViewContainer"] *:not([data-testid="stIconMaterial"]) {
             font-family:'IBM Plex Sans', sans-serif;
+        }
+
+        /* Streamlit's default page padding reserves 96px above the page
+           and 160px below the last widget — generous for a normally-tall
+           page, but with everything else here tightened specifically so
+           the whole app fits in one screen, this was the single biggest
+           remaining chunk of unused space. Streamlit's own floating
+           toolbar (Deploy / menu) sits fixed at the top in a 60px band
+           with a z-index above the page content, so padding-top can't go
+           below that or this header renders underneath it. */
+        [data-testid="stMainBlockContainer"] {
+            padding-top: 44px;
+            padding-bottom: 24px;
         }
 
         /* Break the header iframe out of Streamlit's centered content
@@ -415,8 +412,8 @@ def inject_css():
 
         /* Make the upload dropzone bigger and center its contents */
         [data-testid="stFileUploaderDropzone"] {
-            min-height: 400px;
-            padding: 36px 24px;
+            min-height: 172px;
+            padding: 16px 24px;
             display: flex;
             flex-direction: column;
             align-items: center;
@@ -450,11 +447,20 @@ def inject_css():
            panels instead of thin horizontal strips (they're targeted by
            the container `key=`, so this can't leak onto other borders). */
         .st-key-upload_card, .st-key-pipeline_card {
-            padding: 28px 26px 32px 26px;
+            padding: 16px 22px 16px 22px;
         }
+        /* Streamlit puts a 16px gap between every single element by
+           default (each slider, each caption, each markdown line) — with
+           ~15 elements stacked in this card that alone adds up to over
+           200px. Tightened way down since .stage-row above already adds
+           its own, smaller margin-top for the visual grouping that
+           matters (label+slider+caption as one unit). The card itself
+           *is* the stVerticalBlock Streamlit applies the gap to (the
+           key= class lands directly on it, not a wrapper around it). */
         .st-key-pipeline_card {
             display: flex;
             flex-direction: column;
+            gap: 9px;
         }
 
         .pipeline-heading {
@@ -468,7 +474,7 @@ def inject_css():
         }
         .stage-row {
             display:flex; justify-content:space-between; align-items:baseline;
-            margin-top:16px;
+            margin-top:9px;
         }
         .stage-num {
             font-family:'IBM Plex Mono', monospace; color:#d32f2f; font-size:12px;
