@@ -194,9 +194,9 @@ def _build_sequence(sprite_meta, count, height_range, gap_range, seed, top_range
     height, random trailing gap (and optional vertical jitter) per image,
     so the pattern doesn't look mechanically repeated.
 
-    Returns (html, row_width_px) — the caller needs the exact width to know
-    how many times this row must repeat to safely outrun any viewport
-    (see `_lane_html`).
+    Returns (html, row_width) in authored px — the caller needs the exact
+    width to know how many times this row must repeat to safely outrun any
+    viewport (see `_lane_html`).
     """
     rnd = random.Random(seed)
     n = len(sprite_meta)
@@ -209,21 +209,26 @@ def _build_sequence(sprite_meta, count, height_range, gap_range, seed, top_range
         b64, aspect = sprite_meta[idx]
         h = rnd.randint(*height_range)
         gap = rnd.randint(*gap_range)
-        top = f"margin-top:{rnd.randint(*top_range)}px;" if top_range else ""
+        top = f"--t:{rnd.randint(*top_range)};" if top_range else ""
+        # Sizes are authored in "px of a 200px-tall strip" and stored as bare
+        # numbers; the iframe CSS multiplies them by --vu (1/200 of the strip's
+        # real height), so the whole strip scales with the page (see render_header).
         parts.append(
-            f'<img class="sprite" style="height:{h}px;{top}margin-right:{gap}px;" '
+            f'<img class="sprite" style="--h:{h};--g:{gap};{top}" '
             f'src="data:image/png;base64,{b64}">'
         )
         total_w += h * aspect + gap
     return "".join(parts), total_w
 
 
-MIN_TRACK_WIDTH = 8000  # px a lane must cover before it's safe on any realistic viewport
-# Streamlit's own page padding around the main content block is a fixed
-# ~80px per side regardless of window size (verified empirically), and the
-# header strip itself now runs full-bleed to the true browser edges (see
-# inject_css), so this has to cover the *entire* window width on a large
-# display — comfortably over 5000px on a 5K screen — with margin to spare.
+MIN_TRACK_WIDTH = 8000  # authored px a lane must cover before it's safe on any realistic viewport
+# All sprite sizes and gaps in this file are authored for a 200px-tall strip;
+# the page then scales the strip with the window (see render_header) — about
+# 0.7x on a small laptop window, 2-3x on a large or zoomed-out screen — and
+# every lane's real width scales with it. The strip runs full-bleed to the true
+# browser edges (see inject_css), so a lane has to cover the *entire* window
+# width: 8000 authored px is still ~5500 real px at the smallest scale, which
+# is wider than even a 5K screen.
 
 
 def _lane_html(sprite_meta, count, height_range, gap_range, seed, duration,
@@ -265,18 +270,21 @@ def _spread_speeds(seed, lo, hi, n):
     return [rnd.uniform(lo + (i + 0.15) * band, lo + (i + 0.85) * band) for i in range(n)]
 
 
+def render_title():
+    """The page title, rendered as a normal Streamlit element inside the same
+    1/7/1 column split the cards use, so its left edge lines up with the cards
+    at any window size or zoom level without any hand-tuned offsets."""
+    _, title_col, _ = st.columns([1, 7, 1], gap="large")
+    title_col.markdown('<div class="ufc-title">Urban Fog Cleaner</div>', unsafe_allow_html=True)
+
+
 def render_header():
     cars = load_sprite_meta("cars")
     clouds = load_sprite_meta("clouds")
 
     if not cars or not clouds:
-        # Graceful fallback if the assets folder isn't next to the script.
-        st.title("🌫️ Urban Fog Cleaner")
-        st.caption(
-            "Drop in a hazy photo or pull a frame from a camera export. "
-            "Everything runs on this machine through the real dark-channel-prior "
-            "dehazing pipeline from urban.py."
-        )
+        # Graceful fallback if the assets folder isn't next to the script:
+        # just skip the animated strip (the title is rendered separately).
         return
 
     # Two light car lanes — deliberately sparse (fewer cars than the
@@ -306,43 +314,33 @@ def render_header():
     # behind/around the cars rather than sitting in a separate band above
     # them. Gaps are wider than before (fewer, more spread-out clouds).
     cloud_layers_html = (
-        _lane_html(clouds, count=9, height_range=(75, 110), gap_range=(15, 35),
-                   seed=7, duration=44, top_range=(15, 45), opacity=0.95)
-        + _lane_html(clouds, count=9, height_range=(55, 85), gap_range=(13, 28),
-                     seed=51, duration=61, top_range=(35, 65), opacity=0.80)
-        + _lane_html(clouds, count=9, height_range=(40, 60), gap_range=(11, 24),
-                     seed=83, duration=79, top_range=(55, 85), opacity=0.62)
+        _lane_html(clouds, count=9, height_range=(85, 120), gap_range=(15, 35),
+                   seed=7, duration=44, top_range=(25, 55), opacity=0.95)
+        + _lane_html(clouds, count=9, height_range=(62, 92), gap_range=(13, 28),
+                     seed=51, duration=61, top_range=(45, 75), opacity=0.80)
+        + _lane_html(clouds, count=9, height_range=(45, 65), gap_range=(11, 24),
+                     seed=83, duration=79, top_range=(65, 95), opacity=0.62)
     )
 
     html = f"""
-    <div class="ufc-header">
-      <div class="ufc-topbar">Urban Fog Cleaner</div>
-      <div class="ufc-strip">
-        {cloud_layers_html}
-        {car_layers_html}
-      </div>
+    <div class="ufc-strip">
+      {cloud_layers_html}
+      {car_layers_html}
     </div>
     <style>
-      @import url('https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@700;800&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
       * {{ box-sizing:border-box; }}
-      html, body {{ margin:0; background:#f5f5f5; font-family:'IBM Plex Sans',sans-serif; }}
-      .ufc-header {{ position:relative; overflow:hidden; background:#f5f5f5; }}
-      /* The iframe itself is now full-bleed (see inject_css), so the
-         topbar/title get their own left/right padding here to line back
-         up with the cards below — which now sit in a narrower, centered
-         strip (see the st.columns([1,7,1]) wrapper below the header),
-         not flush against the page edge. That wrapper's left edge works
-         out to (100vw/9 + 84px) — a spacer column that's 1/9 of the
-         content width plus Streamlit's own fixed page margin — so this
-         mirrors that formula instead of a fixed pixel value, to keep
-         tracking it as the window is resized. */
-      .ufc-topbar {{
-        font-family:'Big Shoulders Display',sans-serif; font-weight:800; font-size:19px;
-        text-transform:uppercase; letter-spacing:.03em; color:#111;
-        padding:16px calc(100vw/9 + 84px) 14px calc(100vw/9 + 84px);
-      }}
+      html, body {{ margin:0; background:#f5f5f5; overflow:hidden; }}
+      /* The page scales with the window (see inject_css) and sets this
+         iframe's height in rem, so the strip's own height is the one thing
+         that tracks that scale. Every sprite size, gap and offset below is
+         authored in "px of a 200px-tall strip" (a bare number in the inline
+         style) and multiplied by --vu, 1/200 of the real strip height — so
+         cars and clouds grow and shrink in step with the cards underneath
+         instead of staying a fixed size on a very large or zoomed-out
+         screen. */
+      :root {{ --vu: 0.5vh; }}
       .ufc-strip {{
-        position:relative; height:170px; overflow:hidden;
+        position:relative; height:100vh; overflow:hidden;
         border-top:1px solid rgba(0,0,0,.07);
       }}
       /* Each lane is N copies of one randomized row, slid left by exactly
@@ -354,16 +352,21 @@ def render_header():
       .track {{ position:absolute; left:0; top:0; height:100%; display:flex;
         animation-name: scrollLTR; animation-timing-function: linear;
         animation-iteration-count: infinite; will-change: transform; }}
-      .cloud-layer {{ align-items:flex-start; padding-top:6px; }}
-      .car-layer {{ align-items:flex-end; padding-bottom:12px; }}
-      img.sprite {{ image-rendering:pixelated; display:block; flex-shrink:0; }}
+      .cloud-layer {{ align-items:flex-start; padding-top:calc(6 * var(--vu)); }}
+      .car-layer {{ align-items:flex-end; padding-bottom:calc(12 * var(--vu)); }}
+      img.sprite {{
+        image-rendering:pixelated; display:block; flex-shrink:0;
+        height:calc(var(--h) * var(--vu));
+        margin-right:calc(var(--g) * var(--vu));
+        margin-top:calc(var(--t, 0) * var(--vu));
+      }}
       @keyframes scrollLTR {{
         from {{ transform:translateX(var(--shift)); }}
         to   {{ transform:translateX(0%); }}
       }}
     </style>
     """
-    _embed_html(html, height=226)
+    _embed_html(html, height=200)
 
 
 # ============================================================
@@ -376,116 +379,292 @@ def inject_css():
         <style>
         @import url('https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@700;800&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 
+        /* ------------------------------------------------------------
+           ONE SCALE FOR THE WHOLE PAGE
+           Streamlit sizes almost everything (padding, buttons, sliders,
+           toolbar, gaps) in rem, and everything below is written in rem
+           too, so setting the root font size once scales the entire UI
+           together. It follows the window — whichever of width/height
+           is the tighter fit — so the page looks the same whether it is
+           on a laptop, a big monitor, or a browser that is zoomed out,
+           instead of being a fixed-pixel layout that turns tiny on big
+           screens. ~17.6px at ~1820x940, floored so text stays legible on
+           small windows and capped on huge ones.
+           ------------------------------------------------------------ */
+        html {
+            font-size: clamp(11px, min(0.968vw, 1.84vh), 48px) !important;
+        }
+
         [data-testid="stAppViewContainer"] *:not([data-testid="stIconMaterial"]) {
             font-family:'IBM Plex Sans', sans-serif;
         }
 
-        /* Streamlit's default page padding reserves 96px above the page
-           and 160px below the last widget — generous for a normally-tall
-           page, but with everything else here tightened specifically so
-           the whole app fits in one screen, this was the single biggest
-           remaining chunk of unused space. Streamlit's own floating
-           toolbar (Deploy / menu) sits fixed at the top in a 60px band
-           with a z-index above the page content, so padding-top can't go
-           below that or this header renders underneath it. */
+        /* Page frame. The header toolbar is 3.75rem tall and sits on top of
+           the page, so the content starts just below it; the bottom padding
+           is kept small so the whole app fits one screen. The side padding is
+           Streamlit's own 5rem; max-width only matters on very wide windows,
+           where it stops the cards stretching into long thin bars. */
+        [data-testid="stMain"] { overflow-x: hidden; }
         [data-testid="stMainBlockContainer"] {
-            padding-top: 44px;
-            padding-bottom: 24px;
+            padding: 3.75rem 5rem 1.5rem 5rem;
+            max-width: 112rem;
+            margin-left: auto;
+            margin-right: auto;
+        }
+        /* Vertical spacing between the title, strip and cards is set
+           explicitly below instead of by Streamlit's default 1rem gap
+           between every element. */
+        [data-testid="stMainBlockContainer"] > [data-testid="stVerticalBlock"] { gap: 0; }
+
+        /* The blanket IBM Plex rule above has specificity (0,2,0), which beats
+           a lone class selector, so every rule that wants a different face
+           (display headings, monospace numbers) is written with the same
+           prefix, further down, so it wins on order. */
+        [data-testid="stAppViewContainer"] .ufc-title,
+        [data-testid="stAppViewContainer"] .pipeline-heading,
+        [data-testid="stAppViewContainer"] .card-heading {
+            font-family:'Big Shoulders Display', sans-serif;
+        }
+        [data-testid="stAppViewContainer"] .stage-num,
+        [data-testid="stAppViewContainer"] .stage-value {
+            font-family:'IBM Plex Mono', monospace;
         }
 
-        /* Break the header iframe out of Streamlit's centered content
-           column so the cars/clouds strip can run edge-to-edge of the
-           actual browser window. The rest of the page (upload card,
-           pipeline panel) is untouched and keeps its normal margins —
-           only the element wrapping this one iframe is affected.
-           !important is needed because Streamlit sets an explicit width
-           on this element that would otherwise win. */
+        /* ---------------- title ---------------- */
+        .ufc-title {
+            font-weight:800;
+            font-size:2.3rem; line-height:1; text-transform:uppercase;
+            letter-spacing:.03em; color:#111; margin:.6rem 0 .75rem 0;
+        }
+        /* st.markdown wraps text in a container with a -1rem bottom margin
+           (it expects the paragraph's own bottom margin to cancel it). The
+           title and the readouts below have no such margin, so cancel it. */
+        [data-testid="stMarkdownContainer"]:has(> .ufc-title),
+        .st-key-pipeline_card [data-testid="stMarkdownContainer"] {
+            margin-bottom: 0 !important;
+        }
+
+        /* ---------------- animated strip ----------------
+           Break the header iframe out of Streamlit's centered content
+           column so the cars/clouds strip runs edge-to-edge of the actual
+           browser window. !important is needed because Streamlit sets an
+           explicit width/height on these elements. Its height is in rem so
+           it scales with everything else (the sprites inside scale with
+           this height, see render_header). */
         div[data-testid="stElementContainer"]:has(iframe[data-testid="stIFrame"]) {
             width: 100vw !important;
             max-width: 100vw !important;
+            /* Streamlit gives this wrapper `flex: 0 0 200px`, and flex-basis
+               wins over height — so without resetting it the wrapper could
+               never be shorter than 200px on a small window. */
+            flex: 0 0 auto !important;
+            height: 12.5rem !important;
             position: relative;
             left: 50%;
             right: 50%;
             margin-left: -50vw !important;
             margin-right: -50vw !important;
+            margin-bottom: 1.2rem;
+        }
+        iframe[data-testid="stIFrame"] {
+            height: 12.5rem !important;
+            display: block;
         }
 
-        /* Make the upload dropzone bigger and center its contents */
-        [data-testid="stFileUploaderDropzone"] {
-            min-height: 172px;
-            padding: 16px 24px;
+        /* ---------------- cards ---------------- */
+        .st-key-upload_card, .st-key-pipeline_card {
+            padding: 1.5rem 1.75rem;
+        }
+        /* Buttons scale with the text instead of staying at Streamlit's
+           fixed small size. */
+        .st-key-upload_card button, .st-key-pipeline_card button {
+            font-size: 1.05rem;
+            min-height: 2.8rem;
+        }
+
+        /* Equal-height cards. Streamlit already stretches both columns to
+           the taller one, but the wrapper around each card doesn't grow to
+           fill its column, so the shorter card just stops early. Letting
+           that wrapper grow makes the card fill the column; the upload
+           area then grows to fill its card, so the dropzone simply gets
+           roomier instead of leaving dead space under it. */
+        [data-testid="stLayoutWrapper"]:has(> .st-key-upload_card),
+        [data-testid="stLayoutWrapper"]:has(> .st-key-pipeline_card) {
+            flex: 1 1 auto;
+        }
+        .st-key-upload_card > [data-testid="stElementContainer"]:has([data-testid="stFileUploader"]) {
+            flex: 1 1 auto;
+            display: flex;
+            flex-direction: column;
+        }
+        .st-key-upload_card [data-testid="stFileUploader"] {
+            flex: 1 1 auto;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* ---------------- upload dropzone ----------------
+           One big drop target with its contents centered: an upload icon,
+           the prompt, the red Upload button and the size hint. The icon and
+           prompt are drawn with ::before / ::after (the real label is
+           hidden in the uploader call and kept as the dropzone's aria-label)
+           and `order` slots them around the button that Streamlit renders. */
+        .st-key-upload_card [data-testid="stFileUploaderDropzone"] {
+            flex: 1 1 auto;
+            min-height: 15rem;
+            padding: 1.5rem 1.75rem;
             display: flex;
             flex-direction: column;
             align-items: center;
             justify-content: center;
-            gap: 14px;
+            gap: .85rem;
             border: 2px dashed rgba(0,0,0,.18);
-            border-radius: 12px;
+            border-radius: .9rem;
             background: #fafafa;
         }
-        [data-testid="stFileUploaderDropzoneInstructions"] {
+        .st-key-upload_card [data-testid="stFileUploaderDropzone"]::before {
+            content: "";
+            order: 1;
+            width: 3.6rem;
+            height: 3.6rem;
+            opacity: .6;
+            background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23666' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 15.5V4.5'/%3E%3Cpath d='M7.5 9 12 4.5 16.5 9'/%3E%3Cpath d='M4.5 14.5v3a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-3'/%3E%3C/svg%3E") center / contain no-repeat;
+        }
+        .st-key-upload_card [data-testid="stFileUploaderDropzone"]::after {
+            content: "Drop a foggy photo here";
+            order: 2;
+            font-size: 1.45rem;
+            font-weight: 600;
+            line-height: 1.2;
+            color: #111;
+            margin-bottom: .4rem;
+        }
+        .st-key-upload_card [data-testid="stFileUploaderDropzone"] > span { order: 3; }
+        .st-key-upload_card [data-testid="stFileUploaderDropzoneInstructions"] {
+            order: 4;
+            flex: 0 0 auto;
             display: flex;
             flex-direction: column;
             align-items: center;
         }
+        .st-key-upload_card [data-testid="stFileUploaderDropzoneInstructions"] span,
+        .st-key-upload_card [data-testid="stFileUploaderDropzoneInstructions"] small {
+            font-size: .92rem;
+        }
         /* Red, chunkier "Upload" button inside the dropzone */
-        [data-testid="stFileUploaderDropzone"] button[data-testid="stBaseButton-secondary"] {
+        .st-key-upload_card [data-testid="stFileUploaderDropzone"] button[data-testid="stBaseButton-secondary"] {
             background-color: #d32f2f;
             border-color: #d32f2f;
             color: #ffffff;
-            padding: 0.6rem 1.6rem;
-            font-size: 15px;
-            border-radius: 6px;
+            padding: .7rem 2.1rem;
+            font-size: 1.1rem;
+            border-radius: .4rem;
         }
-        [data-testid="stFileUploaderDropzone"] button[data-testid="stBaseButton-secondary"]:hover {
+        .st-key-upload_card [data-testid="stFileUploaderDropzone"] button[data-testid="stBaseButton-secondary"]:hover {
             background-color: #b71c1c;
             border-color: #b71c1c;
             color: #ffffff;
         }
 
-        /* Give both cards real vertical padding so they read as upright
-           panels instead of thin horizontal strips (they're targeted by
-           the container `key=`, so this can't leak onto other borders). */
-        .st-key-upload_card, .st-key-pipeline_card {
-            padding: 16px 22px 16px 22px;
+        /* After an upload: keep the two preview images inside the card's
+           height (a tall portrait photo would otherwise push the page into
+           a scroll), whatever their shape. */
+        .st-key-upload_card [data-testid="stImage"] img {
+            max-height: 21rem;
+            object-fit: contain;
         }
-        /* Streamlit puts a 16px gap between every single element by
-           default (each slider, each caption, each markdown line) — with
-           ~15 elements stacked in this card that alone adds up to over
-           200px. Tightened way down since .stage-row above already adds
-           its own, smaller margin-top for the visual grouping that
-           matters (label+slider+caption as one unit). The card itself
-           *is* the stVerticalBlock Streamlit applies the gap to (the
-           key= class lands directly on it, not a wrapper around it). */
+        .st-key-upload_card [data-testid="stImageCaption"] { font-size: .95rem; }
+        /* The card is as tall as the pipeline card next to it, so a wide
+           (short) photo pair would leave a blank strip along the bottom.
+           Auto margins on the preview block centre it in the space under
+           the heading instead. */
+        [data-testid="stLayoutWrapper"]:has(> .st-key-preview_images) {
+            margin-top: auto;
+            margin-bottom: auto;
+        }
+
+        /* ---------------- pipeline card ---------------- */
         .st-key-pipeline_card {
             display: flex;
             flex-direction: column;
-            gap: 9px;
+            gap: 0;
+        }
+        /* Each stage (label row + slider + readout) sits in its own keyed
+           container so its internal spacing is exact and the space BETWEEN
+           stages is clearly bigger than the space inside one — that is
+           what makes each readout read as belonging to its own slider. */
+        .st-key-stage_hist, .st-key-stage_freq, .st-key-stage_adapt {
+            gap: .15rem;
+            margin-top: 1.25rem;
+        }
+        .st-key-pipeline_actions {
+            gap: .7rem;
+            margin-top: 1.6rem;
         }
 
         .pipeline-heading {
-            font-family:'Big Shoulders Display', sans-serif; text-transform:uppercase;
-            font-weight:800; font-size:19px; letter-spacing:.02em; color:#111;
-            border-bottom:1px solid rgba(0,0,0,.08); padding-bottom:10px; margin-bottom:6px;
+            text-transform:uppercase;
+            font-weight:800; font-size:2rem; line-height:1.1; letter-spacing:.02em; color:#111;
+            border-bottom:1px solid rgba(0,0,0,.08); padding-bottom:.8rem;
         }
         .card-heading {
-            font-family:'Big Shoulders Display', sans-serif; text-transform:uppercase;
-            font-weight:800; font-size:19px; letter-spacing:.02em; color:#111; margin-bottom:2px;
+            text-transform:uppercase;
+            font-weight:800; font-size:2rem; line-height:1.1; letter-spacing:.02em; color:#111;
         }
         .stage-row {
             display:flex; justify-content:space-between; align-items:baseline;
-            margin-top:9px;
+            line-height:1.3;
         }
         .stage-num {
-            font-family:'IBM Plex Mono', monospace; color:#d32f2f; font-size:12px;
-            margin-right:8px;
+            color:#d32f2f; font-size:.85rem;
+            margin-right:.55rem;
         }
-        .stage-label { font-weight:600; font-size:14px; color:#111; }
+        .stage-label { font-weight:600; font-size:1.08rem; color:#111; }
         .stage-value {
-            font-family:'IBM Plex Mono', monospace; color:#d32f2f; font-weight:600; font-size:14px;
+            color:#d32f2f; font-weight:600; font-size:1.08rem;
         }
-        .stage-readout {
-            font-family:'IBM Plex Mono', monospace; font-size:11px; color:#888888; margin:2px 0 0 0;
+        /* Specific enough (p + container) to beat Streamlit's own
+           `.st-emotion-cache-xxxx p { font-size:inherit; margin:0 }` rule,
+           which otherwise silently overrides a plain class selector. */
+        [data-testid="stMarkdownContainer"] p.stage-readout {
+            font-family:'IBM Plex Mono', monospace; font-size:.84rem; line-height:1.3;
+            color:#777777; margin:0;
+        }
+
+        /* Sliders: a compact track with a comfortably sized thumb. The big
+           (20px) padding Streamlit puts above and below the track is only
+           there to hold the value bubble and the min/max ticks; neither is
+           shown (the live value is in each stage's row), so it is trimmed. */
+        .st-key-pipeline_card [data-testid="stSlider"] > div > div {
+            padding: .75rem 0;
+        }
+        .st-key-pipeline_card [data-testid="stSlider"] div:has(> [data-testid="stSliderThumbValue"]) {
+            width: 1.1rem !important;
+            height: 1.1rem !important;
+        }
+        [data-testid="stSliderTickBar"] { display: none; }
+        /* The little value bubble above the thumb is only shown while the
+           slider is hovered or being dragged. At rest it would sit on top
+           of the label row above it (the live value is always shown at the
+           right end of that row anyway). :focus-visible is deliberately not
+           used — after a mouse drag the browser keeps the hidden range input
+           "focus-visible", which would leave the bubble stuck on screen. */
+        [data-testid="stSliderThumbValue"] {
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity .12s ease;
+            font-size: .88rem;
+            font-weight: 600;
+            background: #ffffff;
+            border: 1px solid rgba(0,0,0,.12);
+            border-radius: .35rem;
+            padding: .05rem .4rem;
+            box-shadow: 0 .1rem .45rem rgba(0,0,0,.14);
+            z-index: 5;
+        }
+        [data-testid="stSlider"]:hover [data-testid="stSliderThumbValue"],
+        [data-testid="stSlider"]:active [data-testid="stSliderThumbValue"] {
+            opacity: 1;
         }
         </style>
         """,
@@ -499,6 +678,7 @@ def inject_css():
 
 st.set_page_config(page_title="Urban Fog Cleaner", page_icon="🌫️", layout="wide")
 inject_css()
+render_title()
 render_header()
 
 if "source_key" not in st.session_state:
@@ -540,6 +720,7 @@ with left_col:
             uploaded_file = st.file_uploader(
                 "Drop a foggy photo here",
                 type=["jpg", "jpeg", "png"],
+                label_visibility="collapsed",
             )
             if uploaded_file is not None:
                 pil_img = Image.open(uploaded_file).convert("RGB")
@@ -564,101 +745,94 @@ with left_col:
                     adaptive_strength=st.session_state.adaptive_strength,
                 )
 
-            col_before, col_after = st.columns(2)
-            with col_before:
-                st.image(st.session_state.source_img, caption="Original", width="stretch")
-            with col_after:
-                st.image(result, caption="Dehazed", width="stretch")
+            with st.container(key="preview_images"):
+                col_before, col_after = st.columns(2)
+                with col_before:
+                    st.image(st.session_state.source_img, caption="Original", width="stretch")
+                with col_after:
+                    st.image(result, caption="Dehazed", width="stretch")
 
 # ------------------------------------------------------------
 # RIGHT CARD — enhancement pipeline
 # ------------------------------------------------------------
+def _stage_row(num, label, value):
+    return (
+        f'<div class="stage-row"><span><span class="stage-num">{num}</span>'
+        f'<span class="stage-label">{label}</span></span>'
+        f'<span class="stage-value">{value}</span></div>'
+    )
+
+
 with right_col:
     with st.container(border=True, key="pipeline_card"):
         st.markdown('<div class="pipeline-heading">Enhancement Pipeline</div>', unsafe_allow_html=True)
 
         # Stage 01 — Histogram Stretch
-        hv = st.session_state.hist_strength
-        st.markdown(
-            f'<div class="stage-row"><span><span class="stage-num">01</span>'
-            f'<span class="stage-label">Histogram Stretch</span></span>'
-            f'<span class="stage-value">{hv}</span></div>',
-            unsafe_allow_html=True,
-        )
-        hist_strength = st.slider("Histogram strength", 0, 100, key="hist_strength",
-                                   label_visibility="collapsed")
-        if has_image:
+        with st.container(key="stage_hist"):
+            st.markdown(_stage_row("01", "Histogram Stretch", st.session_state.hist_strength),
+                        unsafe_allow_html=True)
+            hist_strength = st.slider("Histogram strength", 0, 100, key="hist_strength",
+                                       label_visibility="collapsed")
             percent = 0.5 + (hist_strength / 100.0) * 9.5
-            gray = cv2.cvtColor(st.session_state.source_img, cv2.COLOR_RGB2GRAY)
-            lo, hi = np.percentile(gray, [percent, 100 - percent])
+            if has_image:
+                gray = cv2.cvtColor(st.session_state.source_img, cv2.COLOR_RGB2GRAY)
+                lo, hi = np.percentile(gray, [percent, 100 - percent])
+                range_txt = f"{int(lo)}&ndash;{int(hi)}"
+            else:
+                range_txt = "n/a"
             st.markdown(
-                f'<p class="stage-readout">Clip {percent:.1f}% &middot; Range {int(lo)}&ndash;{int(hi)}</p>',
-                unsafe_allow_html=True,
-            )
-        else:
-            percent = 0.5 + (hist_strength / 100.0) * 9.5
-            st.markdown(
-                f'<p class="stage-readout">Clip {percent:.1f}% &middot; Range n/a</p>',
+                f'<p class="stage-readout">Clip {percent:.1f}% &middot; Range {range_txt}</p>',
                 unsafe_allow_html=True,
             )
 
         # Stage 02 — Frequency-Domain Filter
-        fv = st.session_state.freq_strength
-        st.markdown(
-            f'<div class="stage-row"><span><span class="stage-num">02</span>'
-            f'<span class="stage-label">Frequency-Domain Filter</span></span>'
-            f'<span class="stage-value">{fv}</span></div>',
-            unsafe_allow_html=True,
-        )
-        freq_strength = st.slider("Frequency strength", 0, 100, key="freq_strength",
-                                   label_visibility="collapsed")
-        boost = 0.5 + (freq_strength / 100.0) * 1.5
-        cutoff_txt = "30px" if has_image else "n/a"
-        st.markdown(
-            f'<p class="stage-readout">Boost &times;{boost:.2f} &middot; Cutoff {cutoff_txt}</p>',
-            unsafe_allow_html=True,
-        )
+        with st.container(key="stage_freq"):
+            st.markdown(_stage_row("02", "Frequency-Domain Filter", st.session_state.freq_strength),
+                        unsafe_allow_html=True)
+            freq_strength = st.slider("Frequency strength", 0, 100, key="freq_strength",
+                                       label_visibility="collapsed")
+            boost = 0.5 + (freq_strength / 100.0) * 1.5
+            cutoff_txt = "30px" if has_image else "n/a"
+            st.markdown(
+                f'<p class="stage-readout">Boost &times;{boost:.2f} &middot; Cutoff {cutoff_txt}</p>',
+                unsafe_allow_html=True,
+            )
 
         # Stage 03 — Adaptive Smoothing + Sharpening
-        av = st.session_state.adaptive_strength
-        st.markdown(
-            f'<div class="stage-row"><span><span class="stage-num">03</span>'
-            f'<span class="stage-label">Adaptive Smoothing + Sharpening</span></span>'
-            f'<span class="stage-value">{av}</span></div>',
-            unsafe_allow_html=True,
-        )
-        adaptive_strength = st.slider("Adaptive strength", 0, 100, key="adaptive_strength",
-                                       label_visibility="collapsed")
-        amount = 0.5 + (adaptive_strength / 100.0) * 1.5
-        st.markdown(
-            f'<p class="stage-readout">Edge gain &times;{amount:.2f}</p>',
-            unsafe_allow_html=True,
-        )
-
-        st.write("")
-        b1, b2 = st.columns(2)
-        with b1:
-            st.button("Auto-Enhance", width="stretch", on_click=_apply_auto_enhance)
-        with b2:
-            st.button("Reset", width="stretch", on_click=_apply_reset)
-
-        st.write("")
-        if has_image:
-            st.download_button(
-                "Download Result",
-                data=to_png_bytes(result),
-                file_name="dehazed_result.png",
-                mime="image/png",
-                type="primary",
-                width="stretch",
+        with st.container(key="stage_adapt"):
+            st.markdown(_stage_row("03", "Adaptive Smoothing + Sharpening", st.session_state.adaptive_strength),
+                        unsafe_allow_html=True)
+            adaptive_strength = st.slider("Adaptive strength", 0, 100, key="adaptive_strength",
+                                           label_visibility="collapsed")
+            amount = 0.5 + (adaptive_strength / 100.0) * 1.5
+            st.markdown(
+                f'<p class="stage-readout">Edge gain &times;{amount:.2f}</p>',
+                unsafe_allow_html=True,
             )
-        else:
-            st.download_button(
-                "Download Result",
-                data=b"",
-                file_name="dehazed_result.png",
-                mime="image/png",
-                type="primary",
-                width="stretch",
-                disabled=True,
-            )
+
+        with st.container(key="pipeline_actions"):
+            b1, b2 = st.columns(2)
+            with b1:
+                st.button("Auto-Enhance", width="stretch", on_click=_apply_auto_enhance)
+            with b2:
+                st.button("Reset", width="stretch", on_click=_apply_reset)
+
+            if has_image:
+                st.download_button(
+                    "Download Result",
+                    data=to_png_bytes(result),
+                    file_name="dehazed_result.png",
+                    mime="image/png",
+                    type="primary",
+                    width="stretch",
+                )
+            else:
+                st.download_button(
+                    "Download Result",
+                    data=b"",
+                    file_name="dehazed_result.png",
+                    mime="image/png",
+                    type="primary",
+                    width="stretch",
+                    disabled=True,
+                )
