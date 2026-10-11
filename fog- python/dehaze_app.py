@@ -270,11 +270,18 @@ def _spread_speeds(seed, lo, hi, n):
     return [rnd.uniform(lo + (i + 0.15) * band, lo + (i + 0.85) * band) for i in range(n)]
 
 
+# Column splits shared by the title and the cards. The title is rendered inside
+# the same PAGE_SPLIT as the cards, so its left edge lines up with the cards'
+# left edge at any window size or zoom level without hand-tuned offsets.
+PAGE_SPLIT = [1, 11, 1]   # [left margin, content, right margin]
+CARD_SPLIT = [11, 6]      # [Preview card, Enhancement Pipeline card]
+
+
 def render_title():
-    """The page title, rendered as a normal Streamlit element inside the same
-    1/7/1 column split the cards use, so its left edge lines up with the cards
-    at any window size or zoom level without any hand-tuned offsets."""
-    _, title_col, _ = st.columns([1, 7, 1], gap="large")
+    """The page title. It sits in Streamlit's own top bar (next to the Deploy
+    button) rather than in a row of its own, which hands that height to the
+    cards and so to the preview images — see inject_css."""
+    _, title_col, _ = st.columns(PAGE_SPLIT, gap="large")
     title_col.markdown('<div class="ufc-title">Urban Fog Cleaner</div>', unsafe_allow_html=True)
 
 
@@ -393,20 +400,30 @@ def inject_css():
            ------------------------------------------------------------ */
         html {
             font-size: clamp(11px, min(0.968vw, 1.84vh), 48px) !important;
+
+            /* Height of the two cards: whatever is left of the window under
+               the top bar, the strip and the gap below it (3.75 + 12.5 + 1.2
+               = 17.45rem), minus the page's bottom padding (1.2rem) and a
+               0.15rem allowance for rounding — so the page ends just inside
+               the bottom of the window and never scrolls — but no more than
+               36rem on a very tall window. The preview images are sized from
+               this (see the preview rules below). */
+            --ufc-card-h: min(calc(100vh - 18.8rem), 36rem);
         }
 
         [data-testid="stAppViewContainer"] *:not([data-testid="stIconMaterial"]) {
             font-family:'IBM Plex Sans', sans-serif;
         }
 
-        /* Page frame. The header toolbar is 3.75rem tall and sits on top of
-           the page, so the content starts just below it; the bottom padding
-           is kept small so the whole app fits one screen. The side padding is
+        /* Page frame. The title lives in Streamlit's own 3.75rem top bar, so
+           the content starts right at the top (no top padding) and the title
+           block is exactly as tall as the bar. The bottom padding is kept
+           small so the whole app fits one screen. The side padding is
            Streamlit's own 5rem; max-width only matters on very wide windows,
            where it stops the cards stretching into long thin bars. */
         [data-testid="stMain"] { overflow-x: hidden; }
         [data-testid="stMainBlockContainer"] {
-            padding: 3.75rem 5rem 1.5rem 5rem;
+            padding: 0 5rem 1.2rem 5rem;
             max-width: 112rem;
             margin-left: auto;
             margin-right: auto;
@@ -431,10 +448,18 @@ def inject_css():
         }
 
         /* ---------------- title ---------------- */
+        /* 2.3rem of text + .725rem above and below = 3.75rem, the height of
+           Streamlit's top bar, so the title is centred in that bar on the
+           same line as the Deploy button. The bar is opaque and paints over
+           the page, so the title's container is lifted just above it. */
         .ufc-title {
             font-weight:800;
             font-size:2.3rem; line-height:1; text-transform:uppercase;
-            letter-spacing:.03em; color:#111; margin:.6rem 0 .75rem 0;
+            letter-spacing:.03em; color:#111; margin:.725rem 0;
+        }
+        [data-testid="stMarkdownContainer"]:has(> .ufc-title) {
+            position: relative;
+            z-index: 999991;
         }
         /* st.markdown wraps text in a container with a -1rem bottom margin
            (it expects the paragraph's own bottom margin to cancel it). The
@@ -472,12 +497,19 @@ def inject_css():
         }
 
         /* ---------------- cards ---------------- */
+        /* Both cards always have the same, window-filling height (see
+           --ufc-card-h), whether or not a photo is loaded, so nothing jumps
+           when one is. position:relative anchors the "Processing…" pill. */
         .st-key-upload_card, .st-key-pipeline_card {
             padding: 1.5rem 1.75rem;
+            min-height: var(--ufc-card-h);
+            position: relative;
         }
         /* Buttons scale with the text instead of staying at Streamlit's
-           fixed small size. */
-        .st-key-upload_card button, .st-key-pipeline_card button {
+           fixed small size. (Not the little fullscreen button that appears
+           on an image when it is hovered — that one is meant to stay small.) */
+        .st-key-upload_card button:not([data-testid="stBaseButton-elementToolbar"]),
+        .st-key-pipeline_card button:not([data-testid="stBaseButton-elementToolbar"]) {
             font-size: 1.05rem;
             min-height: 2.8rem;
         }
@@ -566,27 +598,71 @@ def inject_css():
             color: #ffffff;
         }
 
-        /* After an upload: keep the two preview images inside the card's
-           height (a tall portrait photo would otherwise push the page into
-           a scroll), whatever their shape. */
-        .st-key-upload_card [data-testid="stImage"] img {
-            max-height: 21rem;
-            object-fit: contain;
+        /* ---------------- preview images ----------------
+           After an upload the pair is as big as the card allows, whatever
+           the photo's shape. Python publishes the photo's width/height ratio
+           as --pv-ar (see the app section). --pv-maxh is the tallest a
+           picture can be before the card (--ufc-card-h) runs out of room:
+           card height minus its padding (3rem), the heading row (2.8rem),
+           the gap under that (1rem), the caption (1.5rem) and the card's
+           border plus some slack (0.2rem). The block is then sized to
+           exactly two pictures of that height plus the 1rem between them,
+           or to the card's inner width if that is smaller. The two columns
+           inside it, and the images filling them, therefore fit their
+           pictures exactly: no letterboxing, no max-height clipping, and
+           Streamlit's own hover-fullscreen button stays at the corner of
+           the picture itself. */
+        .st-key-upload_card {
+            --pv-maxh: max(12rem, calc(var(--ufc-card-h) - 8.5rem));
         }
-        .st-key-upload_card [data-testid="stImageCaption"] { font-size: .95rem; }
-        /* The card is as tall as the pipeline card next to it, so a wide
-           (short) photo pair would leave a blank strip along the bottom.
-           Auto margins on the preview block centre it in the space under
-           the heading instead. */
+        .st-key-preview_images {
+            flex: 0 1 auto !important;
+            width: min(100%, calc(2 * var(--pv-maxh) * var(--pv-ar, 1.25) + 1rem)) !important;
+            margin-left: auto;
+            margin-right: auto;
+        }
+        .st-key-preview_images [data-testid="stImage"] img {
+            width: 100% !important;
+            height: auto;
+        }
+        .st-key-preview_images [data-testid="stImageCaption"] {
+            margin-top: .3rem;
+            padding: 0;
+        }
+        .st-key-preview_images [data-testid="stImageCaption"] p {
+            font-size: .9rem;
+            line-height: 1.3;
+        }
+        /* Any height the pair doesn't need (a wide, short photo) is split
+           above and below it instead of leaving a blank strip at the bottom. */
         [data-testid="stLayoutWrapper"]:has(> .st-key-preview_images) {
             margin-top: auto;
             margin-bottom: auto;
         }
+        /* st.spinner adds a row to the card (plus a gap) while it works,
+           which would make the card — and the page — jump. Float it instead,
+           in the free space of the heading row so it never covers a photo. */
+        .st-key-upload_card > [data-testid="stElementContainer"]:has(> [data-testid="stSpinner"]) {
+            position: absolute;
+            top: 2.1rem;
+            left: 10.5rem;
+            z-index: 3;
+            width: auto;
+            padding: .3rem .9rem;
+            background: #ffffff;
+            border: 1px solid rgba(0,0,0,.1);
+            border-radius: 999px;
+            box-shadow: 0 .1rem .5rem rgba(0,0,0,.12);
+        }
 
         /* ---------------- pipeline card ---------------- */
+        /* The card is as tall as the window allows, so any height beyond what
+           the controls need is shared out between the sections (the margins
+           below are just the minimum between them). */
         .st-key-pipeline_card {
             display: flex;
             flex-direction: column;
+            justify-content: space-between;
             gap: 0;
         }
         /* Each stage (label row + slider + readout) sits in its own keyed
@@ -708,8 +784,8 @@ has_image = st.session_state.source_img is not None
 # Both cards live inside a narrower, centered strip rather than stretching
 # across the whole wide-mode page — full-width made them read as short,
 # flattened bars instead of the more upright cards they're meant to be.
-_, center_col, _ = st.columns([1, 7, 1], gap="large")
-left_col, right_col = center_col.columns([3, 2], gap="large")
+_, center_col, _ = st.columns(PAGE_SPLIT, gap="large")
+left_col, right_col = center_col.columns(CARD_SPLIT, gap="medium")
 
 # ------------------------------------------------------------
 # LEFT CARD — upload / preview
@@ -728,9 +804,18 @@ with left_col:
                 st.session_state.source_key = f"{uploaded_file.name}-{uploaded_file.size}"
                 st.rerun()
         else:
+            # The photo's shape drives the size of the preview pair (see the
+            # "preview images" CSS). It travels as a CSS variable in a <style>
+            # tag that rides along with the heading, so it adds no element
+            # (and no gap) of its own.
+            src_h, src_w = st.session_state.source_img.shape[:2]
             top_l, top_r = st.columns([3, 1])
             with top_l:
-                st.markdown('<div class="card-heading">Preview</div>', unsafe_allow_html=True)
+                st.markdown(
+                    f'<style>.st-key-preview_images {{ --pv-ar: {src_w / src_h:.4f}; }}</style>'
+                    '<div class="card-heading">Preview</div>',
+                    unsafe_allow_html=True,
+                )
             with top_r:
                 if st.button("Change Image", width="stretch"):
                     st.session_state.source_img = None
