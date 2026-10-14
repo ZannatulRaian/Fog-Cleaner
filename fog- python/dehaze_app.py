@@ -24,9 +24,19 @@ from pathlib import Path
 import cv2
 import numpy as np
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageOps, UnidentifiedImageError
 from scipy import ndimage
 from scipy.fft import fft2, fftshift, ifft2, ifftshift
+
+# Optional extra for iPhone HEIC/HEIF photos (it also gives an older Pillow
+# AVIF support):   pip install pillow-heif
+# The app runs fine without it; such files then get a clear message instead.
+try:
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+except Exception:
+    pass
 
 APP_DIR = Path(__file__).parent
 MAX_DIM = 1200  # images larger than this (on the long edge) are downscaled
@@ -155,7 +165,9 @@ def resize_max(img, max_dim=MAX_DIM):
     h, w = img.shape[:2]
     scale = max_dim / max(h, w)
     if scale < 1:
-        img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+        # max(1, ...) keeps a very thin image (say 1 x 5000 px) from rounding to 0
+        new_size = (max(1, round(w * scale)), max(1, round(h * scale)))
+        img = cv2.resize(img, new_size, interpolation=cv2.INTER_AREA)
     return img
 
 
@@ -163,6 +175,103 @@ def to_png_bytes(img):
     buf = io.BytesIO()
     Image.fromarray(img).save(buf, format="PNG")
     return buf.getvalue()
+
+
+def _readable_formats():
+    """Every format Pillow can decode here, minus EPS. Reading an EPS means
+    handing the file to Ghostscript (a PostScript interpreter): pointless for
+    a photo tool and not something an upload box that takes any file should do."""
+    Image.init()
+    return [name for name in Image.OPEN if name != "EPS"]
+
+
+def load_photo(file):
+    """Open any image Pillow can read and return it as an 8-bit RGB array no
+    bigger than MAX_DIM on its long edge.
+
+    The uploader accepts every file type, so this has to cope with whatever
+    real-world images throw at it: WebP, GIF, BMP, TIFF, AVIF, JPEG 2000, ...
+    (plus HEIC with the optional pillow-heif), the camera's rotation flag,
+    transparency (flattened onto white), 16-bit and float data, CMYK and
+    grayscale files, and animated files (the first frame is used).
+    Raises if the file isn't an image it can read — see unreadable_message().
+    """
+    img = Image.open(file, formats=_readable_formats())
+    # Camera JPEGs can be 40+ megapixels. Let the decoder shrink them while it
+    # reads (a no-op for every other format) — they are downscaled anyway.
+    img.draft("RGB", (MAX_DIM, MAX_DIM))
+    try:
+        img = ImageOps.exif_transpose(img)  # honour the camera's rotation flag
+    except Exception:
+        pass  # broken EXIF block: show the picture as stored
+
+    if img.mode in ("I;16", "I;16L", "I;16B", "I;16N", "I", "F"):
+        # 16-bit / 32-bit / float data. Pillow's own convert() would clip it
+        # at 255 and give a white image, so scale it to 8 bits ourselves.
+        data = np.asarray(img, dtype=np.float32)
+        top = float(data.max()) if data.size else 0.0
+        if img.mode == "F" and top <= 1.0:
+            gain = 255.0               # float pixels in the 0..1 range
+        elif top <= 255.0:
+            gain = 1.0                 # already 8-bit values in a bigger container
+        else:
+            # "16-bit" files often hold 10-, 12- or 14-bit data: the brightest
+            # value tells which full scale to use (65535 for true 16-bit data).
+            full_scale = next((2 ** bits - 1 for bits in (10, 12, 14, 16)
+                               if top <= 2 ** bits - 1), top)
+            gain = 255.0 / full_scale
+        gray = np.clip(data * gain, 0, 255).astype(np.uint8)
+        arr = np.stack([gray] * 3, axis=-1)
+    elif img.mode in ("RGBA", "LA", "PA") or "transparency" in img.info:
+        # Transparent areas would turn black in a plain RGB conversion;
+        # flatten onto white (the colour of fog) instead.
+        rgba = img.convert("RGBA")
+        page = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+        arr = np.array(Image.alpha_composite(page, rgba).convert("RGB"))
+    else:
+        arr = np.array(img.convert("RGB"))
+    return resize_max(arr)
+
+
+_RAW_EXTENSIONS = {".cr2", ".cr3", ".crw", ".nef", ".nrw", ".arw", ".srf", ".sr2", ".dng",
+                   ".raf", ".orf", ".rw2", ".pef", ".srw", ".x3f", ".3fr", ".erf", ".mrw", ".raw"}
+
+
+def unreadable_message(name, exc):
+    """A plain-language explanation for a file load_photo() could not open."""
+    Image.init()  # fills Image.OPEN, which tells us if the optional codecs are installed
+    ext = Path(name).suffix.lower()
+    if isinstance(exc, Image.DecompressionBombError):
+        return f"`{name}` is too large to open safely. Try a smaller copy of the photo."
+    if ext in (".heic", ".heif", ".hif") and "HEIF" not in Image.OPEN:
+        return (f"`{name}` is a HEIC/HEIF photo (the iPhone format), which needs one extra "
+                "package: run `pip install pillow-heif`, restart the app and upload it again. "
+                "Or save the photo as a JPG first.")
+    if ext == ".avif" and "AVIF" not in Image.OPEN:
+        return (f"`{name}` is an AVIF image, which needs a newer Pillow: run "
+                "`pip install --upgrade pillow` (or `pip install pillow-heif`), restart the app "
+                "and upload it again. Or save the image as a JPG first.")
+    if ext in _RAW_EXTENSIONS:
+        return (f"`{name}` is a camera RAW file, which this app can't develop. "
+                "Export the photo as a JPG or TIFF first and upload that.")
+    if isinstance(exc, UnidentifiedImageError):
+        return (f"`{name}` doesn't look like an image this app can open. "
+                "JPG, PNG, WebP, GIF, BMP and TIFF files all work.")
+    reason = " ".join(str(exc).split())[:120]
+    return (f"Couldn't read `{name}`" + (f" ({reason})" if reason else "") + ". The file may be "
+            "damaged or incomplete — try saving it again as a JPG or PNG.")
+
+
+# (label, Pillow's name for it) of the formats worth naming in the uploader's hint.
+_HINT_FORMATS = [("JPG", "JPEG"), ("PNG", "PNG"), ("WebP", "WEBP"), ("GIF", "GIF"),
+                 ("BMP", "BMP"), ("TIFF", "TIFF"), ("AVIF", "AVIF"), ("HEIC", "HEIF")]
+
+
+def supported_formats_hint():
+    """e.g. 'JPG, PNG, WebP, GIF, BMP, TIFF, AVIF and more' — only formats this
+    install can really open (AVIF and HEIC depend on optional codecs)."""
+    Image.init()
+    return ", ".join(label for label, key in _HINT_FORMATS if key in Image.OPEN) + " and more"
 
 
 # ============================================================
@@ -304,29 +413,34 @@ def render_header():
     # doesn't add visible traffic, just variety. Wide gaps mean an edge is
     # more often briefly bare, so both lanes run fast enough that any such
     # gap clears in a couple of seconds rather than sitting there.
+    # The cars are ~18% smaller than in the first version (height 54-58 ->
+    # 44-48); the gaps grew by the same amount, so each lane's total length
+    # — and with it the number of cars on screen and how fast they move — is
+    # unchanged. Cars stand on the strip's bottom edge (.car-layer's
+    # padding-bottom), i.e. they span roughly 140-188 of the 200 units.
     car_speeds = _spread_speeds(seed=101, lo=7, hi=11, n=2)
     car_lane_specs = [(6, 13), (5, 31)]  # (cars in lane, seed)
     car_layers_html = "".join(
-        _lane_html(cars, count=count, height_range=(54, 58), gap_range=(140, 240),
+        _lane_html(cars, count=count, height_range=(44, 48), gap_range=(160, 270),
                    seed=seed, duration=duration)
         for (count, seed), duration in zip(car_lane_specs, car_speeds)
     )
 
-    # Three cloud depth-layers (near/mid/far), sized and positioned to
-    # reach down into the same band the cars occupy (cars sit roughly in
-    # the strip's bottom third — see .car-layer's padding-bottom below)
-    # instead of staying confined to a strip of "sky" above them. Clouds
-    # are still emitted before cars in the HTML, so cars paint on top of
-    # any cloud they overlap — this is what makes the fog read as drifting
-    # behind/around the cars rather than sitting in a separate band above
-    # them. Gaps are wider than before (fewer, more spread-out clouds).
+    # Three cloud depth-layers (near/mid/far). They hang low enough that the
+    # bottom of every cloud drops behind the cars (the bottoms land between
+    # about 125 and 190, the cars span 140-188) instead of floating in a
+    # separate band of "sky" above them. Clouds are emitted before cars in
+    # the HTML, so cars paint on top of any cloud they overlap — that is what
+    # makes the fog read as drifting behind/around the cars. Like the cars
+    # they are ~18% smaller than in the first version, with the gaps widened
+    # to match so there are no more clouds on screen than before.
     cloud_layers_html = (
-        _lane_html(clouds, count=9, height_range=(85, 120), gap_range=(15, 35),
-                   seed=7, duration=44, top_range=(25, 55), opacity=0.95)
-        + _lane_html(clouds, count=9, height_range=(62, 92), gap_range=(13, 28),
-                     seed=51, duration=61, top_range=(45, 75), opacity=0.80)
-        + _lane_html(clouds, count=9, height_range=(45, 65), gap_range=(11, 24),
-                     seed=83, duration=79, top_range=(65, 95), opacity=0.62)
+        _lane_html(clouds, count=9, height_range=(70, 98), gap_range=(34, 78),
+                   seed=7, duration=44, top_range=(52, 86), opacity=0.95)
+        + _lane_html(clouds, count=9, height_range=(51, 75), gap_range=(31, 71),
+                     seed=51, duration=61, top_range=(66, 98), opacity=0.80)
+        + _lane_html(clouds, count=9, height_range=(37, 53), gap_range=(23, 55),
+                     seed=83, duration=79, top_range=(88, 116), opacity=0.62)
     )
 
     html = f"""
@@ -583,6 +697,19 @@ def inject_css():
         .st-key-upload_card [data-testid="stFileUploaderDropzoneInstructions"] small {
             font-size: .92rem;
         }
+        /* The uploader no longer filters by file type, so Streamlit's own hint
+           shows only the size limit; this adds the formats this install opens. */
+        .st-key-upload_card [data-testid="stFileUploaderDropzoneInstructions"]::after {
+            content: "__FORMAT_HINT__";
+            font-size: .92rem;
+            color: rgba(49, 51, 63, .6);
+            margin-top: .15rem;
+        }
+        /* "can't open this file" message: the file name is set in code style,
+           which Streamlit shrinks to 75% — keep it in step with the sentence. */
+        .st-key-upload_card [data-testid="stAlert"] code {
+            font-size: .92em;
+        }
         /* Red, chunkier "Upload" button inside the dropzone */
         .st-key-upload_card [data-testid="stFileUploaderDropzone"] button[data-testid="stBaseButton-secondary"] {
             background-color: #d32f2f;
@@ -743,7 +870,7 @@ def inject_css():
             opacity: 1;
         }
         </style>
-        """,
+        """.replace("__FORMAT_HINT__", supported_formats_hint()),
         unsafe_allow_html=True,
     )
 
@@ -765,6 +892,8 @@ if "source_img" not in st.session_state:
 st.session_state.setdefault("hist_strength", 55)
 st.session_state.setdefault("freq_strength", 55)
 st.session_state.setdefault("adaptive_strength", 50)
+st.session_state.setdefault("upload_round", 0)     # bumped to hand the user a fresh, empty uploader
+st.session_state.setdefault("upload_error", None)  # why the last file couldn't be opened
 
 
 def _apply_auto_enhance():
@@ -793,26 +922,51 @@ left_col, right_col = center_col.columns(CARD_SPLIT, gap="medium")
 with left_col:
     with st.container(border=True, key="upload_card"):
         if not has_image:
+            # No `type=` filter: every image format is accepted (WebP, GIF, BMP,
+            # TIFF, ... — see load_photo). A file that isn't a readable image gets
+            # an explanation under the box, and the box starts over (a new widget
+            # key means a fresh, empty uploader) so the next try is one click away.
             uploaded_file = st.file_uploader(
                 "Drop a foggy photo here",
-                type=["jpg", "jpeg", "png"],
                 label_visibility="collapsed",
+                key=f"photo_uploader_{st.session_state.upload_round}",
             )
             if uploaded_file is not None:
-                pil_img = Image.open(uploaded_file).convert("RGB")
-                st.session_state.source_img = resize_max(np.array(pil_img))
-                st.session_state.source_key = f"{uploaded_file.name}-{uploaded_file.size}"
+                try:
+                    photo = load_photo(uploaded_file)
+                except Exception as exc:
+                    st.session_state.upload_error = unreadable_message(uploaded_file.name, exc)
+                    st.session_state.upload_round += 1
+                else:
+                    st.session_state.upload_error = None
+                    st.session_state.source_img = photo
+                    st.session_state.source_key = f"{uploaded_file.name}-{uploaded_file.size}"
                 st.rerun()
+            if st.session_state.upload_error:
+                st.error(st.session_state.upload_error)
         else:
             # The photo's shape drives the size of the preview pair (see the
             # "preview images" CSS). It travels as a CSS variable in a <style>
             # tag that rides along with the heading, so it adds no element
             # (and no gap) of its own.
             src_h, src_w = st.session_state.source_img.shape[:2]
+            # Only for a sliver of a picture (taller than 5:1, e.g. a long scroll
+            # screenshot): its columns would get too narrow for the captions to
+            # stay on one line, and can't go below 1rem at all, which would
+            # stretch the picture far past the card. So give the pair a minimum
+            # width and cap the picture's height (it is then centred in its
+            # column). Normal photos get no extra rule at all.
+            sliver_cap = (
+                '.st-key-preview_images { width: min(100%, max('
+                'calc(2 * var(--pv-maxh) * var(--pv-ar) + 1rem), 9rem)) !important; }'
+                '.st-key-preview_images [data-testid="stImage"] img '
+                '{ max-height: var(--pv-maxh); object-fit: contain; }'
+                if src_w / src_h < 0.2 else ""
+            )
             top_l, top_r = st.columns([3, 1])
             with top_l:
                 st.markdown(
-                    f'<style>.st-key-preview_images {{ --pv-ar: {src_w / src_h:.4f}; }}</style>'
+                    f'<style>.st-key-preview_images {{ --pv-ar: {src_w / src_h:.4f}; }}{sliver_cap}</style>'
                     '<div class="card-heading">Preview</div>',
                     unsafe_allow_html=True,
                 )
