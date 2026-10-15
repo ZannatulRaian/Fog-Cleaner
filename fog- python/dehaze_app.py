@@ -43,104 +43,148 @@ MAX_DIM = 1200  # images larger than this (on the long edge) are downscaled
 
 
 # ============================================================
-# CORE PIPELINE — copied from urban.py
+# CORE PIPELINE
 # ============================================================
+# Every stage below returns its input untouched when its slider is at 0, so
+# Reset really does switch the three filters off. The Dark Channel Prior
+# fog-removal step (step 1) is the app's base and always runs.
+#
+# Colour handling: the smoothing / sharpening / stretch / frequency stages work
+# on LUMINANCE only (the Y of YCrCb). Treating R, G and B separately shifts hues
+# and paints coloured noise, which is where the purple/blue blotches came from.
 
-def histogram_stretch(img, strength=55):
-    percent = 0.5 + (strength / 100.0) * 9.5
-    result = np.zeros_like(img)
+FREQ_CUTOFF = 30  # frequency-domain cutoff radius, in frequency-plane pixels
 
-    for i in range(3):
-        channel = img[:, :, i]
-        lo, hi = np.percentile(channel, [percent, 100 - percent])
 
-        if hi > lo:
-            stretched = (channel.astype(np.float32) - lo) * 255.0 / (hi - lo)
-            result[:, :, i] = np.clip(stretched, 0, 255).astype(np.uint8)
-        else:
-            result[:, :, i] = channel
+def hist_clip_percent(strength):
+    return (strength / 100.0) * 2.0          # 0 .. 2 % clipped from each end
 
-    return result
+
+def freq_gain(strength):
+    return 1.0 + (strength / 100.0) * 1.5    # gain applied to fine detail
+
+
+def smoothing_tolerance(strength):
+    return 10.0 + 0.6 * strength             # how big a colour step still counts as an edge
+
+
+def edge_gain(strength):
+    return (strength / 100.0) * 2.0          # unsharp-mask amount
+
+
+def _to_ycc(img):
+    ycc = cv2.cvtColor(img.astype(np.float32) / 255.0, cv2.COLOR_RGB2YCrCb)
+    return ycc, ycc[:, :, 0] * 255.0
+
+
+def _from_ycc(ycc, y):
+    out = ycc.copy()
+    out[:, :, 0] = np.clip(y, 0.0, 255.0) / 255.0
+    rgb = cv2.cvtColor(out, cv2.COLOR_YCrCb2RGB)
+    return np.clip(rgb * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+
+def histogram_stretch(img, strength=55, return_range=False):
+    """Linear contrast stretch of the luminance, clipping `percent`% at each end."""
+    percent = hist_clip_percent(strength)
+    ycc, y = _to_ycc(img)
+    lo, hi = np.percentile(y, [percent, 100 - percent])
+    if strength <= 0 or hi - lo < 1.0:
+        out = img
+    else:
+        out = _from_ycc(ycc, (y - lo) * 255.0 / (hi - lo))
+    return (out, (float(lo), float(hi))) if return_range else out
 
 
 def adaptive_smoothing(img, strength=50):
-    sigma = 1.0 + (strength / 100.0) * 2.0
-    result = cv2.bilateralFilter(img, 9, 75, 75)
-    return result
+    """Edge-preserving smoothing: flat areas (and the noise the fog removal
+    amplifies there) are smoothed, edges are kept. The strength sets how big a
+    colour difference still counts as an edge."""
+    if strength <= 0:
+        return img
+    sigma_color = smoothing_tolerance(strength)
+    sigma_space = 3.0 + 0.05 * strength
+    return cv2.bilateralFilter(img, 7, sigma_color, sigma_space)
 
 
 def adaptive_sharpening(img, strength=50):
-    blurred = cv2.GaussianBlur(img, (5, 5), 0)
-    amount = 0.5 + (strength / 100.0) * 1.5
-
-    sharpened = (
-        img.astype(np.float32)
-        + amount * (img.astype(np.float32) - blurred.astype(np.float32))
-    )
-
-    return np.clip(sharpened, 0, 255).astype(np.uint8)
+    """Unsharp mask on luminance, with the added detail capped so strong edges
+    don't overshoot into white halos."""
+    amount = edge_gain(strength)
+    if amount <= 0:
+        return img
+    ycc, y = _to_ycc(img)
+    detail = np.clip(y - cv2.GaussianBlur(y, (0, 0), 1.5), -40.0, 40.0)
+    return _from_ycc(ycc, y + amount * detail)
 
 
 def frequency_enhancement(img, strength=55):
-    img_float = img.astype(np.float32)
-    boost = 0.5 + (strength / 100.0) * 1.5
-
-    enhanced_channels = []
-    for i in range(3):
-        channel = img_float[:, :, i]
-
-        frequency = fft2(channel)
-        frequency_shifted = fftshift(frequency)
-
-        rows, cols = channel.shape
-        crow, ccol = rows // 2, cols // 2
-
-        y, x = np.ogrid[:rows, :cols]
-        distance = np.sqrt((x - ccol) ** 2 + (y - crow) ** 2)
-
-        high_pass = np.zeros((rows, cols), dtype=np.float32)
-        high_pass[distance > 30] = 1.0
-
-        high_frequency = frequency_shifted * high_pass
-        detail = ifft2(ifftshift(high_frequency))
-        detail = np.real(detail)
-
-        detail_mean = np.mean(detail)
-        detail = detail - detail_mean
-        detail_std = np.std(detail)
-        if detail_std > 0:
-            detail = detail / detail_std
-
-        detail = np.clip(detail, -3, 3)
-        detail = detail * 10.0
-
-        enhanced = channel + detail * boost
-        enhanced_channels.append(np.clip(enhanced, 0, 255).astype(np.uint8))
-
-    return np.stack(enhanced_channels, axis=2)
+    """High-frequency emphasis on luminance: a smooth (Gaussian) high-pass, so
+    there is no ringing from a hard cutoff, and the image is mirror-padded so
+    the FFT's wrap-around doesn't leak detail across opposite borders."""
+    gain = freq_gain(strength)
+    if gain <= 1.0:
+        return img
+    ycc, y = _to_ycc(img)
+    h, w = y.shape
+    pad = max(0, min(48, h - 1, w - 1))
+    yp = np.pad(y, pad, mode="reflect") if pad else y
+    rows, cols = yp.shape
+    spectrum = fftshift(fft2(yp))
+    v = np.arange(rows) - rows // 2
+    u = np.arange(cols) - cols // 2
+    d2 = v[:, None] ** 2 + u[None, :] ** 2
+    high_pass = 1.0 - np.exp(-d2 / (2.0 * FREQ_CUTOFF ** 2))
+    response = 1.0 + (gain - 1.0) * high_pass      # 1.0 at DC, `gain` at fine detail
+    out = np.real(ifft2(ifftshift(spectrum * response)))
+    out = out[pad:pad + h, pad:pad + w]
+    return _from_ycc(ycc, out)
 
 
-def dark_channel_prior(img, omega=0.95, t0=0.1, radius=15):
-    img_float = img.astype(np.float32) / 255.0
-    min_img = np.min(img_float, axis=2)
-    dark = ndimage.minimum_filter(min_img, size=radius)
+def _guided_filter(guide, src, radius, eps):
+    """Edge-aware smoothing of `src` that follows the edges of `guide`
+    (He et al., 'Guided Image Filtering')."""
+    k = (2 * radius + 1, 2 * radius + 1)
 
-    flat_dark = dark.flatten()
-    flat_img = img_float.reshape(-1, 3)
-    number_pixels = max(1, int(0.001 * len(flat_dark)))
-    top_indices = np.argsort(flat_dark)[-number_pixels:]
-    A = np.max(flat_img[top_indices], axis=0)
+    def mean(x):
+        return cv2.boxFilter(x, -1, k, borderType=cv2.BORDER_REFLECT)
 
-    transmission = 1 - omega * ndimage.minimum_filter(
-        min_img / max(np.min(A), 1e-6), size=radius
-    )
-    transmission = np.clip(transmission, t0, 1.0)
+    mean_g, mean_s = mean(guide), mean(src)
+    cov = mean(guide * src) - mean_g * mean_s
+    var = mean(guide * guide) - mean_g * mean_g
+    a = cov / (var + eps)
+    b = mean_s - a * mean_g
+    return mean(a) * guide + mean(b)
 
-    result = np.zeros_like(img_float)
-    for i in range(3):
-        result[:, :, i] = (img_float[:, :, i] - A[i]) / transmission + A[i]
 
-    return np.clip(result * 255, 0, 255).astype(np.uint8)
+def dark_channel_prior(img, omega=0.95, t0=0.15):
+    """Single-image haze removal (He et al.): estimate the airlight A and a
+    per-pixel transmission t, then recover J = (I - A) / t + A."""
+    I = img.astype(np.float32) / 255.0
+    h, w = I.shape[:2]
+    size = max(3, round(max(h, w) / 80)) | 1             # odd window, ~15 px at 1200 px
+
+    dark = ndimage.minimum_filter(I.min(axis=2), size=size)
+
+    # Airlight: of the haziest 0.1% of pixels (brightest in the dark channel),
+    # take the single brightest one — one pixel, so its colour stays consistent.
+    n = max(1, int(0.001 * dark.size))
+    idx = np.argpartition(dark.ravel(), -n)[-n:]
+    candidates = I.reshape(-1, 3)[idx]
+    A = np.maximum(candidates[np.argmax(candidates.sum(axis=1))], 0.1)
+
+    # Transmission, each colour channel normalised by ITS OWN airlight value.
+    t = 1.0 - omega * ndimage.minimum_filter((I / A).min(axis=2), size=size)
+
+    # Refine with a guided filter so t follows the photo's real edges. The raw
+    # min-filter map is blocky, which shows up as blocks and halos in the result.
+    gray = cv2.cvtColor(I, cv2.COLOR_RGB2GRAY)
+    radius = max(1, min(size * 3, (min(h, w) - 1) // 2))
+    t = _guided_filter(gray, t.astype(np.float32), radius, 1e-3)
+    t = np.clip(t, t0, 1.0)
+
+    J = (I - A) / t[:, :, None] + A
+    return np.clip(J * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
 
 @st.cache_data(show_spinner=False)
@@ -148,13 +192,15 @@ def cached_dark_channel_prior(img):
     return dark_channel_prior(img)
 
 
-def dehaze_pipeline(img, hist_strength=55, freq_strength=55, adaptive_strength=50):
-    result = cached_dark_channel_prior(img)          # STEP 1 — Dark Channel Prior
-    result = adaptive_smoothing(result, adaptive_strength)   # STEP 2
-    result = adaptive_sharpening(result, adaptive_strength)  # STEP 3
-    result = histogram_stretch(result, hist_strength)        # STEP 4
-    result = frequency_enhancement(result, freq_strength)    # STEP 5
-    return result
+def dehaze_pipeline(img, hist_strength=55, freq_strength=55, smooth_strength=50, sharpen_strength=50):
+    """Returns (result, info). info["hist_range"] is the luminance range the
+    histogram stage actually stretched, for the slider's readout."""
+    result = cached_dark_channel_prior(img)                    # STEP 1 — fog removal
+    result = adaptive_smoothing(result, smooth_strength)         # STEP 2
+    result = adaptive_sharpening(result, sharpen_strength)       # STEP 3
+    result, hist_range = histogram_stretch(result, hist_strength, return_range=True)  # STEP 4
+    result = frequency_enhancement(result, freq_strength)      # STEP 5
+    return result, {"hist_range": hist_range}
 
 
 # ============================================================
@@ -362,6 +408,9 @@ def _lane_html(sprite_meta, count, height_range, gap_range, seed, duration,
 
 
 def _embed_html(html, height):
+    # st.iframe is the supported call on current Streamlit; st.components.v1.html
+    # is deprecated (it prints a warning on every rerun), so it is only a fallback
+    # for older installs that don't have st.iframe yet.
     if hasattr(st, "iframe"):
         st.iframe(html, height=height)
     else:
@@ -382,8 +431,8 @@ def _spread_speeds(seed, lo, hi, n):
 # Column splits shared by the title and the cards. The title is rendered inside
 # the same PAGE_SPLIT as the cards, so its left edge lines up with the cards'
 # left edge at any window size or zoom level without hand-tuned offsets.
-PAGE_SPLIT = [1, 11, 1]   # [left margin, content, right margin]
-CARD_SPLIT = [11, 6]      # [Preview card, Enhancement Pipeline card]
+PAGE_SPLIT = [1, 16, 1]   # [left margin, content, right margin]
+CARD_SPLIT = [5, 2]      # [Preview card, Enhancement Pipeline card]
 
 
 def render_title():
@@ -417,7 +466,7 @@ def render_header():
     # 44-48); the gaps grew by the same amount, so each lane's total length
     # — and with it the number of cars on screen and how fast they move — is
     # unchanged. Cars stand on the strip's bottom edge (.car-layer's
-    # padding-bottom), i.e. they span roughly 140-188 of the 200 units.
+    # padding-bottom), i.e. they span roughly 74-122 of the 200 units.
     car_speeds = _spread_speeds(seed=101, lo=7, hi=11, n=2)
     car_lane_specs = [(6, 13), (5, 31)]  # (cars in lane, seed)
     car_layers_html = "".join(
@@ -426,21 +475,19 @@ def render_header():
         for (count, seed), duration in zip(car_lane_specs, car_speeds)
     )
 
-    # Three cloud depth-layers (near/mid/far). They hang low enough that the
-    # bottom of every cloud drops behind the cars (the bottoms land between
-    # about 125 and 190, the cars span 140-188) instead of floating in a
-    # separate band of "sky" above them. Clouds are emitted before cars in
+    # Two cloud depth-layers (mid/far) — the biggest near layer (70-98 units
+    # tall) was dropped: those clouds dominated the strip. The clouds start
+    # right at the strip's top edge (the header's end line) and hang low
+    # enough that their bottoms still overlap the cars (cloud bottoms land
+    # around 51-101, the cars span ~74-122) so the fog reads as drifting
+    # behind/around the cars. Clouds are emitted before cars in
     # the HTML, so cars paint on top of any cloud they overlap — that is what
-    # makes the fog read as drifting behind/around the cars. Like the cars
-    # they are ~18% smaller than in the first version, with the gaps widened
-    # to match so there are no more clouds on screen than before.
+    # makes the fog read as drifting behind/around the cars.
     cloud_layers_html = (
-        _lane_html(clouds, count=9, height_range=(70, 98), gap_range=(34, 78),
-                   seed=7, duration=44, top_range=(52, 86), opacity=0.95)
-        + _lane_html(clouds, count=9, height_range=(51, 75), gap_range=(31, 71),
-                     seed=51, duration=61, top_range=(66, 98), opacity=0.80)
+        _lane_html(clouds, count=9, height_range=(51, 75), gap_range=(31, 71),
+                   seed=51, duration=61, top_range=(0, 24), opacity=0.80)
         + _lane_html(clouds, count=9, height_range=(37, 53), gap_range=(23, 55),
-                     seed=83, duration=79, top_range=(88, 116), opacity=0.62)
+                     seed=83, duration=79, top_range=(20, 46), opacity=0.62)
     )
 
     html = f"""
@@ -473,8 +520,8 @@ def render_header():
       .track {{ position:absolute; left:0; top:0; height:100%; display:flex;
         animation-name: scrollLTR; animation-timing-function: linear;
         animation-iteration-count: infinite; will-change: transform; }}
-      .cloud-layer {{ align-items:flex-start; padding-top:calc(6 * var(--vu)); }}
-      .car-layer {{ align-items:flex-end; padding-bottom:calc(12 * var(--vu)); }}
+      .cloud-layer {{ align-items:flex-start; padding-top:0; }}
+      .car-layer {{ align-items:flex-end; padding-bottom:calc(78 * var(--vu)); }}
       img.sprite {{
         image-rendering:pixelated; display:block; flex-shrink:0;
         height:calc(var(--h) * var(--vu));
@@ -516,13 +563,13 @@ def inject_css():
             font-size: clamp(11px, min(0.968vw, 1.84vh), 48px) !important;
 
             /* Height of the two cards: whatever is left of the window under
-               the top bar, the strip and the gap below it (3.75 + 12.5 + 1.2
-               = 17.45rem), minus the page's bottom padding (1.2rem) and a
+               the top bar, the strip and the gap below it (3.75 + 7.5 + 1.2
+               = 12.45rem), minus the page's bottom padding (1.2rem) and a
                0.15rem allowance for rounding — so the page ends just inside
                the bottom of the window and never scrolls — but no more than
-               36rem on a very tall window. The preview images are sized from
+               40rem on a very tall window. The preview images are sized from
                this (see the preview rules below). */
-            --ufc-card-h: min(calc(100vh - 18.8rem), 36rem);
+            --ufc-card-h: min(calc(100vh - 13.8rem), 40rem);
         }
 
         [data-testid="stAppViewContainer"] *:not([data-testid="stIconMaterial"]) {
@@ -537,7 +584,7 @@ def inject_css():
            where it stops the cards stretching into long thin bars. */
         [data-testid="stMain"] { overflow-x: hidden; }
         [data-testid="stMainBlockContainer"] {
-            padding: 0 5rem 1.2rem 5rem;
+            padding: 0 2rem 1.2rem 2rem;
             max-width: 112rem;
             margin-left: auto;
             margin-right: auto;
@@ -597,7 +644,7 @@ def inject_css():
                wins over height — so without resetting it the wrapper could
                never be shorter than 200px on a small window. */
             flex: 0 0 auto !important;
-            height: 12.5rem !important;
+            height: 7.5rem !important;
             position: relative;
             left: 50%;
             right: 50%;
@@ -606,7 +653,7 @@ def inject_css():
             margin-bottom: 1.2rem;
         }
         iframe[data-testid="stIFrame"] {
-            height: 12.5rem !important;
+            height: 7.5rem !important;
             display: block;
         }
 
@@ -796,13 +843,13 @@ def inject_css():
            container so its internal spacing is exact and the space BETWEEN
            stages is clearly bigger than the space inside one — that is
            what makes each readout read as belonging to its own slider. */
-        .st-key-stage_hist, .st-key-stage_freq, .st-key-stage_adapt {
+        .st-key-stage_hist, .st-key-stage_freq, .st-key-stage_smooth, .st-key-stage_sharpen {
             gap: .15rem;
-            margin-top: 1.25rem;
+            margin-top: .9rem;
         }
         .st-key-pipeline_actions {
             gap: .7rem;
-            margin-top: 1.6rem;
+            margin-top: 1.2rem;
         }
 
         .pipeline-heading {
@@ -891,7 +938,8 @@ if "source_img" not in st.session_state:
 
 st.session_state.setdefault("hist_strength", 55)
 st.session_state.setdefault("freq_strength", 55)
-st.session_state.setdefault("adaptive_strength", 50)
+st.session_state.setdefault("smooth_strength", 50)
+st.session_state.setdefault("sharpen_strength", 50)
 st.session_state.setdefault("upload_round", 0)     # bumped to hand the user a fresh, empty uploader
 st.session_state.setdefault("upload_error", None)  # why the last file couldn't be opened
 
@@ -899,16 +947,19 @@ st.session_state.setdefault("upload_error", None)  # why the last file couldn't 
 def _apply_auto_enhance():
     st.session_state.hist_strength = 55
     st.session_state.freq_strength = 55
-    st.session_state.adaptive_strength = 50
+    st.session_state.smooth_strength = 50
+    st.session_state.sharpen_strength = 50
 
 
 def _apply_reset():
     st.session_state.hist_strength = 0
     st.session_state.freq_strength = 0
-    st.session_state.adaptive_strength = 0
+    st.session_state.smooth_strength = 0
+    st.session_state.sharpen_strength = 0
 
 
 has_image = st.session_state.source_img is not None
+pipe_info = None  # filled in by the Preview card once a photo is loaded
 
 # Both cards live inside a narrower, centered strip rather than stretching
 # across the whole wide-mode page — full-width made them read as short,
@@ -977,11 +1028,12 @@ with left_col:
                     st.rerun()
 
             with st.spinner("Processing…"):
-                result = dehaze_pipeline(
+                result, pipe_info = dehaze_pipeline(
                     st.session_state.source_img,
                     hist_strength=st.session_state.hist_strength,
                     freq_strength=st.session_state.freq_strength,
-                    adaptive_strength=st.session_state.adaptive_strength,
+                    smooth_strength=st.session_state.smooth_strength,
+                    sharpen_strength=st.session_state.sharpen_strength,
                 )
 
             with st.container(key="preview_images"):
@@ -990,6 +1042,7 @@ with left_col:
                     st.image(st.session_state.source_img, caption="Original", width="stretch")
                 with col_after:
                     st.image(result, caption="Dehazed", width="stretch")
+
 
 # ------------------------------------------------------------
 # RIGHT CARD — enhancement pipeline
@@ -1012,10 +1065,9 @@ with right_col:
                         unsafe_allow_html=True)
             hist_strength = st.slider("Histogram strength", 0, 100, key="hist_strength",
                                        label_visibility="collapsed")
-            percent = 0.5 + (hist_strength / 100.0) * 9.5
-            if has_image:
-                gray = cv2.cvtColor(st.session_state.source_img, cv2.COLOR_RGB2GRAY)
-                lo, hi = np.percentile(gray, [percent, 100 - percent])
+            percent = hist_clip_percent(hist_strength)
+            if has_image and pipe_info:
+                lo, hi = pipe_info["hist_range"]   # measured on this stage's own input
                 range_txt = f"{int(lo)}&ndash;{int(hi)}"
             else:
                 range_txt = "n/a"
@@ -1030,20 +1082,32 @@ with right_col:
                         unsafe_allow_html=True)
             freq_strength = st.slider("Frequency strength", 0, 100, key="freq_strength",
                                        label_visibility="collapsed")
-            boost = 0.5 + (freq_strength / 100.0) * 1.5
-            cutoff_txt = "30px" if has_image else "n/a"
+            boost = freq_gain(freq_strength)
+            cutoff_txt = f"{FREQ_CUTOFF}px" if has_image else "n/a"
             st.markdown(
                 f'<p class="stage-readout">Boost &times;{boost:.2f} &middot; Cutoff {cutoff_txt}</p>',
                 unsafe_allow_html=True,
             )
 
-        # Stage 03 — Adaptive Smoothing + Sharpening
-        with st.container(key="stage_adapt"):
-            st.markdown(_stage_row("03", "Adaptive Smoothing + Sharpening", st.session_state.adaptive_strength),
+        # Stage 03 — Adaptive Smoothing
+        with st.container(key="stage_smooth"):
+            st.markdown(_stage_row("03", "Adaptive Smoothing", st.session_state.smooth_strength),
                         unsafe_allow_html=True)
-            adaptive_strength = st.slider("Adaptive strength", 0, 100, key="adaptive_strength",
-                                           label_visibility="collapsed")
-            amount = 0.5 + (adaptive_strength / 100.0) * 1.5
+            smooth_strength = st.slider("Smoothing strength", 0, 100, key="smooth_strength",
+                                         label_visibility="collapsed")
+            tolerance_txt = f"{smoothing_tolerance(smooth_strength):.0f}" if smooth_strength > 0 else "off"
+            st.markdown(
+                f'<p class="stage-readout">Edge tolerance {tolerance_txt}</p>',
+                unsafe_allow_html=True,
+            )
+
+        # Stage 04 — Adaptive Sharpening
+        with st.container(key="stage_sharpen"):
+            st.markdown(_stage_row("04", "Adaptive Sharpening", st.session_state.sharpen_strength),
+                        unsafe_allow_html=True)
+            sharpen_strength = st.slider("Sharpening strength", 0, 100, key="sharpen_strength",
+                                          label_visibility="collapsed")
+            amount = edge_gain(sharpen_strength)
             st.markdown(
                 f'<p class="stage-readout">Edge gain &times;{amount:.2f}</p>',
                 unsafe_allow_html=True,

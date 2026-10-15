@@ -3,7 +3,3 @@ numpy
 opencv-python-headless
 scipy
 pillow
-
-# Optional: lets the app open iPhone HEIC/HEIF photos (it ships ready-made wheels
-# for Windows, macOS and Linux). Remove the leading "#" to install it with the rest.
-# pillow-heif
