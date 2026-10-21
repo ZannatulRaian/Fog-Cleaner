@@ -13,6 +13,7 @@ The project uses classical image-processing techniques to improve contrast, enha
 ---
 
 ## 🚀 Live Demo
+
 <p align="center">
   <a href="https://fogcleaner.netlify.app/">Live Demo</a>
 </p>
@@ -304,6 +305,7 @@ Final Enhanced Image
 
 The console provides controls for the three processing stages.
 
+
 | Stage                               | Function                                    |
 | ----------------------------------- | ------------------------------------------- |
 | **Histogram Stretch**               | Controls contrast enhancement               |
@@ -521,6 +523,6 @@ MIT License
 
 # 👨‍💻 Author
 
-**Your Name**
+**Zannatul Raian**
 
 Computer Science & Engineering
